@@ -11,8 +11,21 @@ from typing import Any
 try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover - exercised in environments without tqdm
-    def tqdm(iterable, **_kwargs):  # type: ignore[no-redef]
-        return iterable
+    class _TqdmFallback:  # pragma: no cover - exercised in environments without tqdm
+        def __init__(self, iterable=None, **_kwargs: Any):
+            self.iterable = iterable
+
+        def update(self, _n: int = 1) -> None:
+            return None
+
+        def set_postfix(self, **_kwargs: Any) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    def tqdm(iterable=None, **kwargs):  # type: ignore[no-redef]
+        return _TqdmFallback(iterable=iterable, **kwargs)
 
 try:
     from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
@@ -118,6 +131,42 @@ def _should_reuse_cached_payload(payload: dict[str, Any]) -> bool:
     return payload.get("parse_status") in SUCCESS_STATUSES
 
 
+def _build_success_payload(
+    *,
+    question_uid: str,
+    model_name: str,
+    raw_response: str,
+    entities: list[str],
+    prompt_version: str,
+) -> dict[str, Any]:
+    return {
+        "question_uid": question_uid,
+        "model_name": model_name,
+        "raw_response": raw_response,
+        "entities_raw": entities,
+        "parse_status": "empty" if not entities else "ok",
+        "prompt_version": prompt_version,
+    }
+
+
+def _build_error_payload(
+    *,
+    question_uid: str,
+    model_name: str,
+    prompt_version: str,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "question_uid": question_uid,
+        "model_name": model_name,
+        "raw_response": "",
+        "entities_raw": [],
+        "parse_status": "parse_error",
+        "prompt_version": prompt_version,
+        "error": error,
+    }
+
+
 def build_prompt_text(question: str) -> str:
     return f"{INSTRUCTION_BLOCK}\nQuestion:\n{question}\n\nReturn only a JSON array of strings."
 
@@ -161,6 +210,16 @@ def _get_hf_client(model_config: dict[str, Any]):
             f"Missing Hugging Face token for model {model_config['model']}. Set {model_config.get('api_key_env')}."
         )
     return InferenceClient(api_key=api_key)
+
+
+def _get_vllm_components():
+    try:
+        from vllm import LLM, SamplingParams  # type: ignore
+    except ImportError as exc:  # pragma: no cover - exercised only when dependency missing at runtime
+        raise RuntimeError(
+            "vllm is required for local pred extraction. Install it in the active environment before running `--target pred`."
+        ) from exc
+    return LLM, SamplingParams
 
 
 def _request_entities_openai_responses(
@@ -233,6 +292,16 @@ def _request_entities_openai_chat(
     return raw_response, entities
 
 
+def _build_vllm_prompt(question: str, tokenizer: Any) -> str:
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if callable(apply_chat_template):
+        try:
+            return apply_chat_template(build_chat_messages(question), tokenize=False, add_generation_prompt=True)
+        except TypeError:
+            return apply_chat_template(build_chat_messages(question), tokenize=False)
+    return build_prompt_text(question)
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_fixed(1),
@@ -282,29 +351,19 @@ def _extract_payload_for_record(
     return payload
 
 
-def extract_entities_for_records(
+def _collect_pending_jobs(
     records: list[dict[str, Any]],
     *,
     model_config: dict[str, Any],
     extraction_config: dict[str, Any],
     cache_dir: Path,
-    workers: int = 1,
-    force: bool = False,
-) -> list[dict[str, Any]]:
-    if workers <= 0:
-        raise ValueError(f"`workers` must be positive, got {workers}.")
+    force: bool,
+    progress: Any,
+) -> tuple[list[dict[str, Any] | None], list[tuple[int, dict[str, Any], Path]], int]:
     outputs: list[dict[str, Any] | None] = [None] * len(records)
     model_dir = cache_dir / _slugify_model_name(model_config["model"])
     model_dir.mkdir(parents=True, exist_ok=True)
     cache_hits = 0
-    api_calls = 0
-    parse_errors = 0
-    progress = tqdm(
-        records,
-        desc=f"Extracting {model_config['model']}",
-        unit="question",
-        dynamic_ncols=True,
-    )
     pending_jobs: list[tuple[int, dict[str, Any], Path]] = []
     for index, record in enumerate(records):
         cache_key = build_cache_key(
@@ -321,10 +380,182 @@ def extract_entities_for_records(
                 cache_hits += 1
                 if hasattr(progress, "update"):
                     progress.update(1)
-                if hasattr(progress, "set_postfix"):
-                    progress.set_postfix(cached=cache_hits, api=api_calls, errors=parse_errors)
                 continue
         pending_jobs.append((index, record, cache_path))
+    return outputs, pending_jobs, cache_hits
+
+
+def _chunk_items(items: list[tuple[int, dict[str, Any], Path]], chunk_size: int) -> list[list[tuple[int, dict[str, Any], Path]]]:
+    return [items[start : start + chunk_size] for start in range(0, len(items), chunk_size)]
+
+
+def _extract_entities_for_records_vllm(
+    records: list[dict[str, Any]],
+    *,
+    model_config: dict[str, Any],
+    extraction_config: dict[str, Any],
+    cache_dir: Path,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    progress = tqdm(
+        total=len(records),
+        desc=f"Extracting {model_config['model']}",
+        unit="question",
+        dynamic_ncols=True,
+    )
+    outputs, pending_jobs, cache_hits = _collect_pending_jobs(
+        records,
+        model_config=model_config,
+        extraction_config=extraction_config,
+        cache_dir=cache_dir,
+        force=force,
+        progress=progress,
+    )
+    api_calls = 0
+    parse_errors = 0
+    if hasattr(progress, "set_postfix"):
+        progress.set_postfix(cached=cache_hits, api=api_calls, errors=parse_errors)
+    if not pending_jobs:
+        if hasattr(progress, "close"):
+            progress.close()
+        return [payload for payload in outputs if payload is not None]
+
+    LLM, SamplingParams = _get_vllm_components()
+    llm_kwargs: dict[str, Any] = {"model": model_config["model"]}
+    for key in (
+        "tokenizer",
+        "dtype",
+        "tensor_parallel_size",
+        "gpu_memory_utilization",
+        "max_model_len",
+        "trust_remote_code",
+        "download_dir",
+        "enforce_eager",
+    ):
+        if key in model_config:
+            llm_kwargs[key] = model_config[key]
+    llm = LLM(**llm_kwargs)
+    tokenizer = llm.get_tokenizer()
+    sampling_params = SamplingParams(
+        temperature=extraction_config["temperature"],
+        top_p=extraction_config["top_p"],
+        max_tokens=extraction_config["max_tokens"],
+    )
+    batch_size = int(model_config.get("batch_size", 128))
+    if batch_size <= 0:
+        raise ValueError(f"`batch_size` must be positive, got {batch_size}.")
+
+    try:
+        for batch in _chunk_items(pending_jobs, batch_size):
+            prompts = [_build_vllm_prompt(record["question"], tokenizer) for _, record, _ in batch]
+            try:
+                responses = llm.generate(prompts, sampling_params, use_tqdm=False)
+                if len(responses) != len(batch):
+                    raise ExtractionError(
+                        f"vLLM returned {len(responses)} outputs for a batch of size {len(batch)}."
+                    )
+                batch_payloads: list[dict[str, Any]] = []
+                for response, (_, record, _cache_path) in zip(responses, batch, strict=True):
+                    raw_response = ""
+                    if response.outputs:
+                        raw_response = response.outputs[0].text or ""
+                    if not raw_response.strip():
+                        raise ExtractionError("Model returned empty response.")
+                    entities = parse_entity_response(raw_response)
+                    batch_payloads.append(
+                        _build_success_payload(
+                            question_uid=record["question_uid"],
+                            model_name=model_config["model"],
+                            raw_response=raw_response,
+                            entities=entities,
+                            prompt_version=extraction_config["prompt_version"],
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001
+                batch_payloads = []
+                for _, record, _cache_path in batch:
+                    try:
+                        prompt = _build_vllm_prompt(record["question"], tokenizer)
+                        single_response = llm.generate([prompt], sampling_params, use_tqdm=False)[0]
+                        raw_response = ""
+                        if single_response.outputs:
+                            raw_response = single_response.outputs[0].text or ""
+                        if not raw_response.strip():
+                            raise ExtractionError("Model returned empty response.")
+                        entities = parse_entity_response(raw_response)
+                        batch_payloads.append(
+                            _build_success_payload(
+                                question_uid=record["question_uid"],
+                                model_name=model_config["model"],
+                                raw_response=raw_response,
+                                entities=entities,
+                                prompt_version=extraction_config["prompt_version"],
+                            )
+                        )
+                    except Exception as single_exc:  # noqa: BLE001
+                        batch_payloads.append(
+                            _build_error_payload(
+                                question_uid=record["question_uid"],
+                                model_name=model_config["model"],
+                                prompt_version=extraction_config["prompt_version"],
+                                error=str(single_exc if str(single_exc) else exc),
+                            )
+                        )
+
+            for payload, (index, _record, cache_path) in zip(batch_payloads, batch, strict=True):
+                outputs[index] = payload
+                write_json(cache_path, payload, pretty=True)
+                api_calls += 1
+                if payload["parse_status"] == "parse_error":
+                    parse_errors += 1
+                if hasattr(progress, "update"):
+                    progress.update(1)
+                if hasattr(progress, "set_postfix"):
+                    progress.set_postfix(cached=cache_hits, api=api_calls, errors=parse_errors)
+    finally:
+        if hasattr(progress, "close"):
+            progress.close()
+    return [payload for payload in outputs if payload is not None]
+
+
+def extract_entities_for_records(
+    records: list[dict[str, Any]],
+    *,
+    model_config: dict[str, Any],
+    extraction_config: dict[str, Any],
+    cache_dir: Path,
+    workers: int = 1,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    if model_config.get("provider") == "vllm_local":
+        return _extract_entities_for_records_vllm(
+            records,
+            model_config=model_config,
+            extraction_config=extraction_config,
+            cache_dir=cache_dir,
+            force=force,
+        )
+    if workers <= 0:
+        raise ValueError(f"`workers` must be positive, got {workers}.")
+    outputs: list[dict[str, Any] | None]
+    api_calls = 0
+    parse_errors = 0
+    progress = tqdm(
+        total=len(records),
+        desc=f"Extracting {model_config['model']}",
+        unit="question",
+        dynamic_ncols=True,
+    )
+    outputs, pending_jobs, cache_hits = _collect_pending_jobs(
+        records,
+        model_config=model_config,
+        extraction_config=extraction_config,
+        cache_dir=cache_dir,
+        force=force,
+        progress=progress,
+    )
+    if hasattr(progress, "set_postfix"):
+        progress.set_postfix(cached=cache_hits, api=api_calls, errors=parse_errors)
     if workers == 1:
         for index, record, cache_path in pending_jobs:
             payload = _extract_payload_for_record(

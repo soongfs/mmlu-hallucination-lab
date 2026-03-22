@@ -20,6 +20,11 @@ dependencies = [
   "tqdm>=4.66.0",
 ]
 
+[project.optional-dependencies]
+vllm = [
+  "vllm>=0.6.1",
+]
+
 [project.scripts]
 mmlu-entity-corr = "mmlu_entity_corr.cli:main"
 

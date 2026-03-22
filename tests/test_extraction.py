@@ -121,6 +121,33 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(entities, ["Napoleon"])
         mocked.assert_called_once()
 
+    def test_vllm_local_provider_dispatch(self) -> None:
+        records = [{"question_uid": "q1", "question": "Who led the French Revolution?"}]
+        model_config = {"model": "meta-llama/Llama-3.1-8B-Instruct", "provider": "vllm_local", "batch_size": 8}
+        extraction_config = {"prompt_version": "v1", "temperature": 0, "top_p": 1, "max_tokens": 32, "seed": 42}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_dir = Path(tmp_dir)
+            expected = [
+                {
+                    "question_uid": "q1",
+                    "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+                    "raw_response": '["Napoleon"]',
+                    "entities_raw": ["Napoleon"],
+                    "parse_status": "ok",
+                    "prompt_version": "v1",
+                }
+            ]
+            with patch("mmlu_entity_corr.extraction._extract_entities_for_records_vllm", return_value=expected) as mocked:
+                outputs = extract_entities_for_records(
+                    records,
+                    model_config=model_config,
+                    extraction_config=extraction_config,
+                    cache_dir=cache_dir,
+                    workers=4,
+                )
+        self.assertEqual(outputs, expected)
+        mocked.assert_called_once()
+
     def test_extract_entities_rejects_non_positive_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = Path(tmp_dir)

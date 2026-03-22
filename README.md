@@ -10,9 +10,9 @@ This repository provides a Python CLI pipeline for:
 ## Quick start
 
 ```bash
-python -m venv .venv
+uv venv
 source .venv/bin/activate
-pip install -e .
+uv pip install -e .[vllm]
 ```
 
 Run the stages in order:
@@ -29,27 +29,29 @@ Default configuration lives in `configs/experiment.yaml`.
 ## Model backends
 
 - `GPT-5.4` uses the OpenAI `responses.create(...)` API through the configured proxy base URL.
-- `Llama-3.1-8B-Instruct` defaults to a local `vLLM` OpenAI-compatible server at `http://127.0.0.1:8000/v1`.
+- `Llama-3.1-8B-Instruct` defaults to in-process local `vLLM` inference via `vllm.LLM(...)`.
 - Long `extract-entities` runs show a `tqdm` progress bar with cached-hit, API-call, and error counts.
-- `extract-entities` supports parallel API calls; default worker count is configured in `configs/experiment.yaml`, and you can override it with `--workers`.
+- `extract-entities` supports parallel API calls for remote providers; for local `vLLM`, throughput is controlled by vLLM batching instead of `--workers`.
 
 ## Local vLLM for `pred`
 
-Start a local `vLLM` server with your Hugging Face access token so it can download the gated model:
+The `pred` path loads `meta-llama/Llama-3.1-8B-Instruct` directly inside the extraction process. Set your Hugging Face token so vLLM can download the gated model:
 
 ```bash
 export HF_TOKEN=...
-vllm serve meta-llama/Llama-3.1-8B-Instruct \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --api-key local-vllm
 ```
 
-If you use a different address or API key, set:
+Then run:
 
 ```bash
-export VLLM_BASE_URL=http://127.0.0.1:8000/v1
-export VLLM_API_KEY=local-vllm
+uv run --env-file .env mmlu-entity-corr extract-entities --target pred
 ```
 
-`HF_TOKEN` is used by the `vLLM` server to pull the model from Hugging Face. The pipeline itself talks only to the local `vLLM` HTTP endpoint for `pred`.
+Useful `pred` model knobs live in `configs/experiment.yaml`:
+
+- `dtype`
+- `tensor_parallel_size`
+- `gpu_memory_utilization`
+- `batch_size`
+
+`HF_TOKEN` is used by the in-process vLLM runtime to pull the model from Hugging Face.
