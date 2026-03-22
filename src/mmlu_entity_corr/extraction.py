@@ -114,6 +114,10 @@ def _slugify_model_name(model_name: str) -> str:
     return "".join(char if char.isalnum() else "_" for char in model_name.lower()).strip("_")
 
 
+def _should_reuse_cached_payload(payload: dict[str, Any]) -> bool:
+    return payload.get("parse_status") in SUCCESS_STATUSES
+
+
 def build_prompt_text(question: str) -> str:
     return f"{INSTRUCTION_BLOCK}\nQuestion:\n{question}\n\nReturn only a JSON array of strings."
 
@@ -131,7 +135,7 @@ def _get_openai_client(model_config: dict[str, Any]):
     except ImportError as exc:  # pragma: no cover - exercised only when dependency missing at runtime
         raise RuntimeError("openai is required for entity extraction.") from exc
     base_url = os.environ.get(model_config.get("base_url_env", ""), model_config.get("base_url"))
-    api_key = os.environ.get(model_config.get("api_key_env", ""), "")
+    api_key = os.environ.get(model_config.get("api_key_env", ""), "") or model_config.get("api_key", "")
     if not api_key and not base_url:
         raise RuntimeError(
             f"Missing API key for model {model_config['model']}. Set {model_config.get('api_key_env')}."
@@ -206,6 +210,29 @@ def _request_entities_huggingface_chat(
     return raw_response, entities
 
 
+def _request_entities_openai_chat(
+    question: str,
+    model_config: dict[str, Any],
+    extraction_config: dict[str, Any],
+) -> tuple[str, list[str]]:
+    client = _get_openai_client(model_config)
+    request_kwargs: dict[str, Any] = {
+        "model": model_config["model"],
+        "messages": build_chat_messages(question),
+        "temperature": extraction_config["temperature"],
+        "top_p": extraction_config["top_p"],
+        "max_tokens": extraction_config["max_tokens"],
+    }
+    if model_config.get("supports_seed"):
+        request_kwargs["seed"] = extraction_config.get("seed")
+    response = client.chat.completions.create(**request_kwargs)
+    raw_response = response.choices[0].message.content or ""
+    if not raw_response.strip():
+        raise ExtractionError("Model returned empty response.")
+    entities = parse_entity_response(raw_response)
+    return raw_response, entities
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_fixed(1),
@@ -216,6 +243,8 @@ def _request_entities(question: str, model_config: dict[str, Any], extraction_co
     provider = model_config.get("provider", "openai_responses")
     if provider == "openai_responses":
         return _request_entities_openai_responses(question, model_config, extraction_config)
+    if provider == "openai_chat":
+        return _request_entities_openai_chat(question, model_config, extraction_config)
     if provider == "huggingface_chat":
         return _request_entities_huggingface_chat(question, model_config, extraction_config)
     raise ExtractionError(f"Unsupported extraction provider: {provider}")
@@ -287,13 +316,14 @@ def extract_entities_for_records(
         cache_path = model_dir / f"{cache_key}.json"
         if cache_path.exists() and not force:
             cached = read_json(cache_path)
-            outputs[index] = cached
-            cache_hits += 1
-            if hasattr(progress, "update"):
-                progress.update(1)
-            if hasattr(progress, "set_postfix"):
-                progress.set_postfix(cached=cache_hits, api=api_calls, errors=parse_errors)
-            continue
+            if _should_reuse_cached_payload(cached):
+                outputs[index] = cached
+                cache_hits += 1
+                if hasattr(progress, "update"):
+                    progress.update(1)
+                if hasattr(progress, "set_postfix"):
+                    progress.set_postfix(cached=cache_hits, api=api_calls, errors=parse_errors)
+                continue
         pending_jobs.append((index, record, cache_path))
     if workers == 1:
         for index, record, cache_path in pending_jobs:

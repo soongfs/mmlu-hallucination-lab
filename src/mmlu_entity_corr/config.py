@@ -43,10 +43,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
             },
         },
         "pred": {
-            "provider": "huggingface_chat",
+            "provider": "openai_chat",
             "model": "meta-llama/Llama-3.1-8B-Instruct",
-            "api_key_env": "HF_TOKEN",
-            "supports_seed": True,
+            "base_url": "http://127.0.0.1:8000/v1",
+            "base_url_env": "VLLM_BASE_URL",
+            "api_key": "local-vllm",
+            "api_key_env": "VLLM_API_KEY",
+            "supports_seed": False,
         },
     },
     "extraction": {

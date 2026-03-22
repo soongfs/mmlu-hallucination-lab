@@ -7,7 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mmlu_entity_corr.config import load_config
-from mmlu_entity_corr.extraction import extract_entities, extract_entities_for_records, parse_entity_response
+from mmlu_entity_corr.extraction import (
+    _request_entities,
+    extract_entities,
+    extract_entities_for_records,
+    parse_entity_response,
+)
 
 
 class ExtractionTests(unittest.TestCase):
@@ -45,6 +50,33 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(second[0]["entities_raw"], ["Napoleon"])
         self.assertEqual(mocked.call_count, 1)
 
+    def test_cached_parse_error_is_retried(self) -> None:
+        records = [{"question_uid": "q1", "question": "Who led the French Revolution?"}]
+        model_config = {"model": "gpt-5.4"}
+        extraction_config = {"prompt_version": "v1", "temperature": 0, "top_p": 1, "max_tokens": 32, "seed": 42}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_dir = Path(tmp_dir)
+            with patch(
+                "mmlu_entity_corr.extraction._request_entities",
+                side_effect=[RuntimeError("503"), ('["Napoleon"]', ["Napoleon"])],
+            ) as mocked:
+                first = extract_entities_for_records(
+                    records,
+                    model_config=model_config,
+                    extraction_config=extraction_config,
+                    cache_dir=cache_dir,
+                )
+                second = extract_entities_for_records(
+                    records,
+                    model_config=model_config,
+                    extraction_config=extraction_config,
+                    cache_dir=cache_dir,
+                )
+        self.assertEqual(first[0]["parse_status"], "parse_error")
+        self.assertEqual(second[0]["parse_status"], "ok")
+        self.assertEqual(second[0]["entities_raw"], ["Napoleon"])
+        self.assertEqual(mocked.call_count, 2)
+
     def test_parallel_extraction_preserves_input_order(self) -> None:
         records = [
             {"question_uid": "q1", "question": "Q1"},
@@ -71,6 +103,23 @@ class ExtractionTests(unittest.TestCase):
                 )
         self.assertEqual([row["question_uid"] for row in outputs], ["q1", "q2", "q3"])
         self.assertEqual([row["entities_raw"] for row in outputs], [["Q1"], ["Q2"], ["Q3"]])
+
+    def test_openai_chat_provider_dispatch(self) -> None:
+        model_config = {
+            "model": "meta-llama/Llama-3.1-8B-Instruct",
+            "provider": "openai_chat",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key": "local-vllm",
+        }
+        extraction_config = {"prompt_version": "v1", "temperature": 0, "top_p": 1, "max_tokens": 32, "seed": 42}
+        with patch(
+            "mmlu_entity_corr.extraction._request_entities_openai_chat",
+            return_value=('["Napoleon"]', ["Napoleon"]),
+        ) as mocked:
+            raw_response, entities = _request_entities("Who led the French Revolution?", model_config, extraction_config)
+        self.assertEqual(raw_response, '["Napoleon"]')
+        self.assertEqual(entities, ["Napoleon"])
+        mocked.assert_called_once()
 
     def test_extract_entities_rejects_non_positive_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

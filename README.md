@@ -29,6 +29,27 @@ Default configuration lives in `configs/experiment.yaml`.
 ## Model backends
 
 - `GPT-5.4` uses the OpenAI `responses.create(...)` API through the configured proxy base URL.
-- `Llama-3.1-8B-Instruct` uses Hugging Face chat completions with `HF_TOKEN`.
+- `Llama-3.1-8B-Instruct` defaults to a local `vLLM` OpenAI-compatible server at `http://127.0.0.1:8000/v1`.
 - Long `extract-entities` runs show a `tqdm` progress bar with cached-hit, API-call, and error counts.
 - `extract-entities` supports parallel API calls; default worker count is configured in `configs/experiment.yaml`, and you can override it with `--workers`.
+
+## Local vLLM for `pred`
+
+Start a local `vLLM` server with your Hugging Face access token so it can download the gated model:
+
+```bash
+export HF_TOKEN=...
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --api-key local-vllm
+```
+
+If you use a different address or API key, set:
+
+```bash
+export VLLM_BASE_URL=http://127.0.0.1:8000/v1
+export VLLM_API_KEY=local-vllm
+```
+
+`HF_TOKEN` is used by the `vLLM` server to pull the model from Hugging Face. The pipeline itself talks only to the local `vLLM` HTTP endpoint for `pred`.
