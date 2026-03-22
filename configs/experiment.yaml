@@ -1,0 +1,55 @@
+{
+  "dataset": {
+    "path": "cais/mmlu",
+    "name": "all",
+    "split": "test"
+  },
+  "paths": {
+    "artifacts_dir": "artifacts",
+    "dataset_with_acc": "artifacts/dataset_with_acc.jsonl",
+    "alignment_failures": "artifacts/debug/alignment_failures.jsonl",
+    "gold_entities": "artifacts/gold_entities.jsonl",
+    "pred_entities": "artifacts/pred_entities.jsonl",
+    "entity_scores": "artifacts/entity_scores.jsonl",
+    "correlation_summary": "artifacts/reports/correlation_summary.json",
+    "included_samples": "artifacts/reports/included_samples.csv",
+    "excluded_samples": "artifacts/reports/excluded_samples.csv",
+    "threshold_sweep": "artifacts/reports/threshold_sweep.csv",
+    "cache_dir": "artifacts/cache"
+  },
+  "models": {
+    "gold": {
+      "provider": "openai_responses",
+      "model": "gpt-5.4",
+      "base_url": "https://sub2api.jntm.us/v1",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "supports_seed": false,
+      "default_headers": {
+        "User-Agent": "codex-cli/1.0"
+      }
+    },
+    "pred": {
+      "provider": "huggingface_chat",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "api_key_env": "HF_TOKEN",
+      "supports_seed": true
+    }
+  },
+  "extraction": {
+    "prompt_version": "v1",
+    "temperature": 0,
+    "top_p": 1,
+    "max_tokens": 256,
+    "seed": 42,
+    "workers": 4
+  },
+  "matching": {
+    "threshold": 0.9,
+    "threshold_sweep": [0.85, 0.88, 0.9, 0.92, 0.95]
+  },
+  "analysis": {
+    "bootstrap_samples": 10000,
+    "seed": 42
+  }
+}

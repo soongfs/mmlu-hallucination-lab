@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmlu-entity-corr"
+version = "0.1.0"
+description = "CLI pipeline for correlating MMLU entity recall with model accuracy."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=1.35.0",
+  "datasets>=2.20.0",
+  "huggingface_hub>=0.24.1",
+  "rapidfuzz>=3.9.0",
+  "pandas>=2.2.0",
+  "scipy>=1.13.0",
+  "tenacity>=8.3.0",
+  "orjson>=3.10.0",
+  "tqdm>=4.66.0",
+]
+
+[project.scripts]
+mmlu-entity-corr = "mmlu_entity_corr.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
