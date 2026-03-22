@@ -50,8 +50,14 @@ from .io_utils import read_json, read_jsonl, write_json, write_jsonl
 from .json_utils import loads
 
 
-INSTRUCTION_BLOCK = """Please identify the entities in the given question.
-Return the answer directly as a JSON list of strings.
+INSTRUCTION_BLOCK = """Please extract entity or concept spans from the question.
+Return only a JSON list of strings.
+
+Rules:
+- Copy spans verbatim from the question text.
+- Do not answer or complete the question.
+- Do not paraphrase or infer missing text.
+- If there are no valid spans, return [].
 
 Q: Which education institution has a sports team named George Washington Colonials men's basketball?
 A: ["George Washington Colonials men's basketball"]
@@ -68,6 +74,14 @@ SUCCESS_STATUSES = {"ok", "empty"}
 
 class ExtractionError(RuntimeError):
     """Raised when an extraction request cannot be parsed after retries."""
+
+
+class ResponseParseError(ExtractionError):
+    """Raised when the model returns text that cannot be parsed as the required JSON array."""
+
+    def __init__(self, message: str, *, raw_response: str):
+        super().__init__(message)
+        self.raw_response = raw_response
 
 
 def build_cache_key(question_uid: str, model_name: str, prompt_version: str, provider: str) -> str:
@@ -155,11 +169,12 @@ def _build_error_payload(
     model_name: str,
     prompt_version: str,
     error: str,
+    raw_response: str = "",
 ) -> dict[str, Any]:
     return {
         "question_uid": question_uid,
         "model_name": model_name,
-        "raw_response": "",
+        "raw_response": raw_response,
         "entities_raw": [],
         "parse_status": "parse_error",
         "prompt_version": prompt_version,
@@ -168,13 +183,13 @@ def _build_error_payload(
 
 
 def build_prompt_text(question: str) -> str:
-    return f"{INSTRUCTION_BLOCK}\nQuestion:\n{question}\n\nReturn only a JSON array of strings."
+    return f"{INSTRUCTION_BLOCK}\n\nQ: {question}\nA:"
 
 
 def build_chat_messages(question: str) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": INSTRUCTION_BLOCK},
-        {"role": "user", "content": question},
+        {"role": "user", "content": f"Q: {question}\nA:"},
     ]
 
 
@@ -242,7 +257,10 @@ def _request_entities_openai_responses(
     raw_response = response.output_text or ""
     if not raw_response.strip():
         raise ExtractionError("Model returned empty response.")
-    entities = parse_entity_response(raw_response)
+    try:
+        entities = parse_entity_response(raw_response)
+    except Exception as exc:
+        raise ResponseParseError(str(exc), raw_response=raw_response) from exc
     return raw_response, entities
 
 
@@ -265,7 +283,10 @@ def _request_entities_huggingface_chat(
     raw_response = response.choices[0].message.content or ""
     if not raw_response.strip():
         raise ExtractionError("Model returned empty response.")
-    entities = parse_entity_response(raw_response)
+    try:
+        entities = parse_entity_response(raw_response)
+    except Exception as exc:
+        raise ResponseParseError(str(exc), raw_response=raw_response) from exc
     return raw_response, entities
 
 
@@ -288,7 +309,10 @@ def _request_entities_openai_chat(
     raw_response = response.choices[0].message.content or ""
     if not raw_response.strip():
         raise ExtractionError("Model returned empty response.")
-    entities = parse_entity_response(raw_response)
+    try:
+        entities = parse_entity_response(raw_response)
+    except Exception as exc:
+        raise ResponseParseError(str(exc), raw_response=raw_response) from exc
     return raw_response, entities
 
 
@@ -300,6 +324,40 @@ def _build_vllm_prompt(question: str, tokenizer: Any) -> str:
         except TypeError:
             return apply_chat_template(build_chat_messages(question), tokenize=False)
     return build_prompt_text(question)
+
+
+def _build_vllm_sampling_params(SamplingParams: Any, extraction_config: dict[str, Any]) -> Any:
+    base_kwargs: dict[str, Any] = {
+        "temperature": extraction_config["temperature"],
+        "top_p": extraction_config["top_p"],
+        "max_tokens": extraction_config["max_tokens"],
+    }
+    schema = {
+        "type": "array",
+        "items": {"type": "string"},
+    }
+    try:
+        from vllm.sampling_params import StructuredOutputsParams  # type: ignore
+
+        return SamplingParams(
+            **base_kwargs,
+            structured_outputs=StructuredOutputsParams(json=schema),
+        )
+    except Exception:
+        pass
+    try:
+        from vllm.sampling_params import GuidedDecodingParams  # type: ignore
+
+        if hasattr(GuidedDecodingParams, "from_optional"):
+            guided = GuidedDecodingParams.from_optional(json=schema)
+        else:
+            guided = GuidedDecodingParams(json=schema)
+        return SamplingParams(
+            **base_kwargs,
+            guided_decoding=guided,
+        )
+    except Exception:
+        return SamplingParams(**base_kwargs)
 
 
 @retry(
@@ -329,24 +387,21 @@ def _extract_payload_for_record(
     payload: dict[str, Any]
     try:
         raw_response, entities = _request_entities(record["question"], model_config, extraction_config)
-        payload = {
-            "question_uid": record["question_uid"],
-            "model_name": model_config["model"],
-            "raw_response": raw_response,
-            "entities_raw": entities,
-            "parse_status": "empty" if not entities else "ok",
-            "prompt_version": extraction_config["prompt_version"],
-        }
+        payload = _build_success_payload(
+            question_uid=record["question_uid"],
+            model_name=model_config["model"],
+            raw_response=raw_response,
+            entities=entities,
+            prompt_version=extraction_config["prompt_version"],
+        )
     except Exception as exc:  # noqa: BLE001
-        payload = {
-            "question_uid": record["question_uid"],
-            "model_name": model_config["model"],
-            "raw_response": "",
-            "entities_raw": [],
-            "parse_status": "parse_error",
-            "prompt_version": extraction_config["prompt_version"],
-            "error": str(exc),
-        }
+        payload = _build_error_payload(
+            question_uid=record["question_uid"],
+            model_name=model_config["model"],
+            prompt_version=extraction_config["prompt_version"],
+            error=str(exc),
+            raw_response=getattr(exc, "raw_response", ""),
+        )
     write_json(cache_path, payload, pretty=True)
     return payload
 
@@ -436,11 +491,7 @@ def _extract_entities_for_records_vllm(
             llm_kwargs[key] = model_config[key]
     llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
-    sampling_params = SamplingParams(
-        temperature=extraction_config["temperature"],
-        top_p=extraction_config["top_p"],
-        max_tokens=extraction_config["max_tokens"],
-    )
+    sampling_params = _build_vllm_sampling_params(SamplingParams, extraction_config)
     batch_size = int(model_config.get("batch_size", 128))
     if batch_size <= 0:
         raise ValueError(f"`batch_size` must be positive, got {batch_size}.")
@@ -461,7 +512,10 @@ def _extract_entities_for_records_vllm(
                         raw_response = response.outputs[0].text or ""
                     if not raw_response.strip():
                         raise ExtractionError("Model returned empty response.")
-                    entities = parse_entity_response(raw_response)
+                    try:
+                        entities = parse_entity_response(raw_response)
+                    except Exception as parse_exc:
+                        raise ResponseParseError(str(parse_exc), raw_response=raw_response) from parse_exc
                     batch_payloads.append(
                         _build_success_payload(
                             question_uid=record["question_uid"],
@@ -482,7 +536,10 @@ def _extract_entities_for_records_vllm(
                             raw_response = single_response.outputs[0].text or ""
                         if not raw_response.strip():
                             raise ExtractionError("Model returned empty response.")
-                        entities = parse_entity_response(raw_response)
+                        try:
+                            entities = parse_entity_response(raw_response)
+                        except Exception as parse_exc:
+                            raise ResponseParseError(str(parse_exc), raw_response=raw_response) from parse_exc
                         batch_payloads.append(
                             _build_success_payload(
                                 question_uid=record["question_uid"],
@@ -499,6 +556,7 @@ def _extract_entities_for_records_vllm(
                                 model_name=model_config["model"],
                                 prompt_version=extraction_config["prompt_version"],
                                 error=str(single_exc if str(single_exc) else exc),
+                                raw_response=getattr(single_exc, "raw_response", ""),
                             )
                         )
 

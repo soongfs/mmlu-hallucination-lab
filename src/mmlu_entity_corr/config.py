@@ -53,7 +53,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "extraction": {
-        "prompt_version": "v1",
+        "prompt_version": "v2",
         "temperature": 0,
         "top_p": 1,
         "max_tokens": 256,
